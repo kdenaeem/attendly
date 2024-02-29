@@ -1,0 +1,6 @@
+{
+  "appTitle": "attendly",
+  "@appTitle": {
+    "description": "The title of the application"
+  }
+}
