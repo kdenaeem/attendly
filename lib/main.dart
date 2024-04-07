@@ -1,8 +1,11 @@
 import 'dart:async';
-import 'dart:convert';
+import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'package:attendly/ml_service.dart';
+import 'package:flutter/services.dart';
+import 'package:image/image.dart' as imglib;
 
 // import 'package:google_ml_kit/google_ml_kit.dart';
 import 'package:camera/camera.dart';
@@ -13,7 +16,7 @@ import 'package:google_ml_kit/google_ml_kit.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final cameras = await availableCameras();
-  print(cameras);
+
   CameraDescription? firstCamera;
   firstCamera = cameras.last;
 
@@ -60,7 +63,11 @@ class TakePictureScreen extends StatefulWidget {
 
 class TakePictureScreenState extends State<TakePictureScreen> {
   late CameraController _controller;
+
   late Future<void> _initializeControllerFuture;
+  List<Face> _detectedFaces = [];
+  ui.Size? _currentImage;
+  final MLService _mlService = MLService(); // Initialize MLService
 
   @override
   void initState() {
@@ -68,8 +75,20 @@ class TakePictureScreenState extends State<TakePictureScreen> {
     _controller = CameraController(
       widget.camera,
       ResolutionPreset.medium,
+      imageFormatGroup: Platform.isAndroid
+          ? ImageFormatGroup.nv21
+          : ImageFormatGroup.bgra8888,
     );
-    _initializeControllerFuture = _controller.initialize();
+    bool canProcess = false;
+    _initializeControllerFuture = _controller.initialize().then((_) {
+      _controller.startImageStream((CameraImage image) {
+        if (canProcess) return;
+        canProcess = true;
+        _processCameraImage(image, widget.camera);
+        canProcess = false;
+      });
+      return null;
+    });
   }
 
   @override
@@ -78,43 +97,162 @@ class TakePictureScreenState extends State<TakePictureScreen> {
     super.dispose();
   }
 
+  Future<void> _processCameraImage(
+      CameraImage image, CameraDescription camera) async {
+    List<Face> faces = await _processFaces(image, camera);
+    // Call recognizeFaces function here
+
+    setState(() {
+      _currentImage = ui.Size(
+        _controller.value.previewSize!.height,
+        _controller.value.previewSize!.width,
+      );
+      if (faces != null) {
+        _mlService.recognizeFaces(faces);
+
+        _detectedFaces = faces;
+      }
+    });
+  }
+
+  Future<List<Face>> _processFaces(
+      CameraImage image, CameraDescription camera) async {
+    InputImage? inputImage = _inputImageFromCameraImage(image, camera);
+    final faceDetector = GoogleMlKit.vision.faceDetector(FaceDetectorOptions());
+    return await faceDetector.processImage(inputImage!);
+  }
+
+  final _orientations = {
+    DeviceOrientation.portraitUp: 0,
+    DeviceOrientation.landscapeLeft: 90,
+    DeviceOrientation.portraitDown: 180,
+    DeviceOrientation.landscapeRight: 270,
+  };
+
+  InputImage? _inputImageFromCameraImage(
+      CameraImage image, CameraDescription camera) {
+    final sensorOrientation = camera.sensorOrientation;
+
+    InputImageRotation? rotation;
+
+    var rotationCompensation =
+        _orientations[_controller.value.deviceOrientation];
+
+    if (rotationCompensation == null) return null;
+    if (camera.lensDirection == CameraLensDirection.front) {
+      rotationCompensation = (sensorOrientation + rotationCompensation) % 360;
+    } else {
+      rotationCompensation =
+          (sensorOrientation - rotationCompensation + 360) % 360;
+    }
+
+    rotation = InputImageRotationValue.fromRawValue(rotationCompensation) ??
+        InputImageRotation.rotation0deg;
+    final format = InputImageFormatValue.fromRawValue(image.format.raw) ??
+        InputImageFormat.nv21;
+
+    final inputImageData = InputImageMetadata(
+      size: ui.Size(image.width.toDouble(), image.height.toDouble()),
+      rotation: rotation,
+      format: format,
+      bytesPerRow: image.planes[0].bytesPerRow,
+    );
+    final plane = image.planes.first;
+
+    final inputImage = InputImage.fromBytes(
+      bytes: plane.bytes,
+      metadata: inputImageData,
+    );
+
+    return inputImage;
+  }
+
   @override
   Widget build(BuildContext context) {
+    print(_detectedFaces.isNotEmpty ? _detectedFaces[0] : 'No faces detected');
+    final width = MediaQuery.of(context).size.width;
+    final height = MediaQuery.of(context).size.height;
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Take a picture')),
-      body: FutureBuilder<void>(
-        future: _initializeControllerFuture,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState == ConnectionState.done) {
-            return Column(
-              children: [
-                Expanded(child: CameraPreview(_controller)),
-                ElevatedButton(
-                  onPressed: () async {
-                    try {
-                      final image = await _controller.takePicture();
+        body: Stack(
+      alignment: Alignment.bottomCenter, // Align children to the bottom center
+      children: [
+        Transform.scale(
+          scale: 1.0,
+          child: AspectRatio(
+            aspectRatio: MediaQuery.of(context).size.aspectRatio,
+            child: OverflowBox(
+              alignment: Alignment.center,
+              child: FittedBox(
+                fit: BoxFit.fitHeight,
+                child: Container(
+                  width: width,
+                  height: width * _controller.value.aspectRatio,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: <Widget>[
+                      CameraPreview(_controller),
+                      if (_detectedFaces
+                          .isNotEmpty) // Check if _detectedFaces is not empty
+                        CustomPaint(
+                          painter: FacePainter(
+                            face: _detectedFaces[0],
+                            imageSize: _currentImage!,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+        Padding(
+          padding:
+              const EdgeInsets.only(bottom: 20.0), // Add some bottom padding
+          child: ElevatedButton(
+            onPressed: () async {
+              try {
+                final image = await _controller.takePicture();
 
-                      if (!context.mounted) return;
+                if (!context.mounted) return;
 
-                      await Navigator.of(context).push(MaterialPageRoute(
-                          builder: (context) =>
-                              DisplayPictureScreen(imagePath: image.path)));
-                    } catch (e) {
-                      print(e);
-                    }
-                  },
-                  child: Text('Capture Image'),
-                )
-              ],
-            );
+                await Navigator.of(context).push(MaterialPageRoute(
+                    builder: (context) =>
+                        DisplayPictureScreen(imagePath: image.path)));
+              } catch (e) {
+                print(e);
+              }
+            },
+            child: Text('Capture Image'),
+          ),
+        ),
+      ],
+    )
 
-            // return CameraPreview(_controller);
-          } else {
-            return const Center(child: CircularProgressIndicator());
-          }
-        },
-      ),
-    );
+        // appBar: AppBar(title: const Text('Take a picture')),
+        // body: FutureBuilder<void>(
+        //   future: _initializeControllerFuture,
+        //   builder: (context, snapshot) {
+        //     if (snapshot.connectionState == ConnectionState.done) {
+        //       return Stack(
+        //         children: <Widget>[
+        //           CameraPreview(_controller),
+        //           if (_currentImage != null)
+        //             CustomPaint(
+        //               painter: FacePainter(
+        //                 face: _detectedFaces[0],
+        //                 imageSize: _currentImage!,
+        //               ),
+        //             ),
+        //         ],
+        //       );
+        //     } else {
+        //       return const Center(child: CircularProgressIndicator());
+        //     }
+        //   },
+        // ),
+        );
   }
 }
 
@@ -168,12 +306,19 @@ class _DisplayPictureScreenState extends State<DisplayPictureScreen> {
         future: _futureImage,
         builder: (context, snapshot) {
           if (snapshot.hasData) {
-            final image = snapshot.data![0] as ui.Image;
-            final faces = snapshot.data![1] as List<Face>;
+            // final image = snapshot.data![0] as ui.Image;
+            // final faces = snapshot.data![1] as List<Face>;
             return Stack(
               children: [
                 Image.file(File(widget.imagePath)),
-                CustomPaint(painter: FacePainter(image, faces)),
+                // CustomPaint(
+                //       painter: FacePainter(
+                //         face: faces[0],
+                //         imageSize: image,
+                //       ),
+                //     )
+
+                // CustomPaint(painter: FacePainter(image, faces)),
               ],
             );
           }
