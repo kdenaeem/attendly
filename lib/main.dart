@@ -3,7 +3,8 @@ import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
-import 'package:attendly/ml_service.dart';
+import 'package:attendly/intepreter/Recognition.dart';
+import 'package:attendly/services/ml_service.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as imglib;
 
@@ -62,32 +63,37 @@ class TakePictureScreen extends StatefulWidget {
 }
 
 class TakePictureScreenState extends State<TakePictureScreen> {
-  late CameraController _controller;
+  late dynamic _controller;
 
   late Future<void> _initializeControllerFuture;
   List<Face> _detectedFaces = [];
   ui.Size? _currentImage;
-  final MLService _mlService = MLService(); // Initialize MLService
+  bool isBusy = false;
 
+  late MLService _mlService;
   @override
   void initState() {
     super.initState();
-    _controller = CameraController(
-      widget.camera,
-      ResolutionPreset.medium,
-      imageFormatGroup: Platform.isAndroid
-          ? ImageFormatGroup.nv21
-          : ImageFormatGroup.bgra8888,
-    );
-    bool canProcess = false;
-    _initializeControllerFuture = _controller.initialize().then((_) {
-      _controller.startImageStream((CameraImage image) {
-        if (canProcess) return;
-        canProcess = true;
-        _processCameraImage(image, widget.camera);
-        canProcess = false;
+    _mlService = MLService();
+
+    initialiseCamera();
+  }
+
+  initialiseCamera() async {
+    _controller = CameraController(widget.camera, ResolutionPreset.medium,
+        imageFormatGroup: Platform.isAndroid
+            ? ImageFormatGroup.nv21
+            : ImageFormatGroup.bgra8888);
+    await _controller.initialize().then((_) {
+      if (!mounted) {
+        return;
+      }
+      _controller.startImageStream((image) {
+        if (!isBusy) {
+          isBusy = true;
+          _processCameraImage(image, widget.camera);
+        }
       });
-      return null;
     });
   }
 
@@ -97,29 +103,24 @@ class TakePictureScreenState extends State<TakePictureScreen> {
     super.dispose();
   }
 
+  dynamic _scanResults;
+
   Future<void> _processCameraImage(
       CameraImage image, CameraDescription camera) async {
-    List<Face> faces = await _processFaces(image, camera);
+    InputImage? inputImage = _inputImageFromCameraImage(image, camera);
+
+    List<Face> faces = await _processFaces(inputImage!, camera);
     // Call recognizeFaces function here
-
-    setState(() {
-      _currentImage = ui.Size(
-        _controller.value.previewSize!.height,
-        _controller.value.previewSize!.width,
-      );
-      if (faces != null) {
-        _mlService.recognizeFaces(faces);
-
-        _detectedFaces = faces;
-      }
-    });
+    if (faces.isNotEmpty) {
+      recogniseFaces(faces[0], inputImage);
+      _detectedFaces = faces;
+    }
   }
 
   Future<List<Face>> _processFaces(
-      CameraImage image, CameraDescription camera) async {
-    InputImage? inputImage = _inputImageFromCameraImage(image, camera);
+      InputImage image, CameraDescription camera) async {
     final faceDetector = GoogleMlKit.vision.faceDetector(FaceDetectorOptions());
-    return await faceDetector.processImage(inputImage!);
+    return await faceDetector.processImage(image);
   }
 
   final _orientations = {
@@ -167,164 +168,306 @@ class TakePictureScreenState extends State<TakePictureScreen> {
     return inputImage;
   }
 
+  imglib.Image decodeYUV420SP(InputImage image) {
+    final width = image.metadata!.size.width.toInt();
+    final height = image.metadata!.size.height.toInt();
+
+    Uint8List yuv420sp = image.bytes!;
+    //int total = width * height;
+    //Uint8List rgb = Uint8List(total);
+    final outImg =
+        imglib.Image(width: width, height: height); // default numChannels is 3
+
+    final int frameSize = width * height;
+
+    for (int j = 0, yp = 0; j < height; j++) {
+      int uvp = frameSize + (j >> 1) * width, u = 0, v = 0;
+      for (int i = 0; i < width; i++, yp++) {
+        int y = (0xff & yuv420sp[yp]) - 16;
+        if (y < 0) y = 0;
+        if ((i & 1) == 0) {
+          v = (0xff & yuv420sp[uvp++]) - 128;
+          u = (0xff & yuv420sp[uvp++]) - 128;
+        }
+        int y1192 = 1192 * y;
+        int r = (y1192 + 1634 * v);
+        int g = (y1192 - 833 * v - 400 * u);
+        int b = (y1192 + 2066 * u);
+
+        if (r < 0)
+          r = 0;
+        else if (r > 262143) r = 262143;
+        if (g < 0)
+          g = 0;
+        else if (g > 262143) g = 262143;
+        if (b < 0)
+          b = 0;
+        else if (b > 262143) b = 262143;
+
+        // I don't know how these r, g, b values are defined, I'm just copying what you had bellow and
+        // getting their 8-bit values.
+        outImg.setPixelRgb(i, j, ((r << 6) & 0xff0000) >> 16,
+            ((g >> 2) & 0xff00) >> 8, b & 0xff);
+
+        /*rgb[yp] = 0xff000000 |
+            ((r << 6) & 0xff0000) |
+            ((g >> 2) & 0xff00) |
+            ((b >> 10) & 0xff);*/
+      }
+    }
+    return outImg;
+  }
+
+  bool register = false;
+  CameraLensDirection camDirec = CameraLensDirection.front;
+  recogniseFaces(Face face, InputImage frame) async {
+    final Rect boundingBox = face.boundingBox;
+
+    imglib.Image image = decodeYUV420SP(frame);
+    image = imglib.copyRotate(image!,
+        angle: camDirec == CameraLensDirection.front ? 270 : 90);
+
+    Rect faceRect = face.boundingBox;
+    imglib.Image croppedFace = imglib.copyCrop(image!,
+        x: faceRect.left.toInt(),
+        y: faceRect.top.toInt(),
+        width: faceRect.width.toInt(),
+        height: faceRect.height.toInt());
+    // Returns the embedding of the face
+    // afterwards store the embedding with the name
+    Recognition recognition = _mlService.recognise(croppedFace, boundingBox);
+    if (recognition.distance > 1.25) {
+      recognition.name = "Unknown";
+    }
+
+    if (register) {
+      showFaceRegistrationDialogue(croppedFace!, recognition);
+      register = false;
+    }
+
+    setState(() {
+      isBusy = false;
+      _scanResults = recognition;
+    });
+  }
+
+  TextEditingController textEditingController = TextEditingController();
+  showFaceRegistrationDialogue(
+      imglib.Image croppedFace, Recognition recognition) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("Face Registration", textAlign: TextAlign.center),
+        alignment: Alignment.center,
+        content: SizedBox(
+          height: 340,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              const SizedBox(
+                height: 20,
+              ),
+              Image.memory(
+                Uint8List.fromList(imglib.encodeBmp(croppedFace!)),
+                width: 200,
+                height: 200,
+              ),
+              SizedBox(
+                width: 200,
+                child: TextField(
+                    controller: textEditingController,
+                    decoration: const InputDecoration(
+                        fillColor: Colors.white,
+                        filled: true,
+                        hintText: "Enter Name")),
+              ),
+              const SizedBox(
+                height: 10,
+              ),
+              ElevatedButton(
+                  onPressed: () {
+                    _mlService.registerFaceInDB(
+                        textEditingController.text, recognition.embedding);
+                    textEditingController.text = "";
+                    Navigator.pop(context);
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                      content: Text("Face Registered"),
+                    ));
+                  },
+                  style: ElevatedButton.styleFrom(
+                      primary: Colors.blue,
+                      minimumSize: const ui.Size(200, 40)),
+                  child: const Text("Register"))
+            ],
+          ),
+        ),
+        contentPadding: EdgeInsets.zero,
+      ),
+    );
+  }
+
+  Widget buildResult() {
+    if (_scanResults == null ||
+        _controller == null ||
+        !_controller.value.isInitialized) {
+      return const Center(child: Text('Camera is not initialized'));
+    }
+
+    final ui.Size imageSize = ui.Size(
+      _controller.value.previewSize!.height,
+      _controller.value.previewSize!.width,
+    );
+
+    return CustomPaint(
+      painter: FacePainter(
+        face: _detectedFaces[0],
+        imageSize: imageSize,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     print(_detectedFaces.isNotEmpty ? _detectedFaces[0] : 'No faces detected');
-    final width = MediaQuery.of(context).size.width;
-    final height = MediaQuery.of(context).size.height;
+    List<Widget> stackChildren = [];
+    final size = MediaQuery.sizeOf(context);
+    if (_controller != null) {
+      stackChildren.add(Positioned(
+          top: 0.0,
+          left: 0.0,
+          width: size.width,
+          height: size.height,
+          child: Container(
+            child: (_controller.value.isInitialized)
+                ? AspectRatio(
+                    aspectRatio: _controller.value.aspectRatio,
+                    child: CameraPreview(_controller),
+                  )
+                : Container(),
+          )));
 
-    return Scaffold(
-        body: Stack(
-      alignment: Alignment.bottomCenter, // Align children to the bottom center
-      children: [
-        Transform.scale(
-          scale: 1.0,
-          child: AspectRatio(
-            aspectRatio: MediaQuery.of(context).size.aspectRatio,
-            child: OverflowBox(
-              alignment: Alignment.center,
-              child: FittedBox(
-                fit: BoxFit.fitHeight,
-                child: Container(
-                  width: width,
-                  height: width * _controller.value.aspectRatio,
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: <Widget>[
-                      CameraPreview(_controller),
-                      if (_detectedFaces
-                          .isNotEmpty) // Check if _detectedFaces is not empty
-                        CustomPaint(
-                          painter: FacePainter(
-                            face: _detectedFaces[0],
-                            imageSize: _currentImage!,
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
-        Padding(
-          padding:
-              const EdgeInsets.only(bottom: 20.0), // Add some bottom padding
-          child: ElevatedButton(
-            onPressed: () async {
-              try {
-                final image = await _controller.takePicture();
-
-                if (!context.mounted) return;
-
-                await Navigator.of(context).push(MaterialPageRoute(
-                    builder: (context) =>
-                        DisplayPictureScreen(imagePath: image.path)));
-              } catch (e) {
-                print(e);
-              }
-            },
-            child: Text('Capture Image'),
-          ),
-        ),
-      ],
-    )
-
-        // appBar: AppBar(title: const Text('Take a picture')),
-        // body: FutureBuilder<void>(
-        //   future: _initializeControllerFuture,
-        //   builder: (context, snapshot) {
-        //     if (snapshot.connectionState == ConnectionState.done) {
-        //       return Stack(
-        //         children: <Widget>[
-        //           CameraPreview(_controller),
-        //           if (_currentImage != null)
-        //             CustomPaint(
-        //               painter: FacePainter(
-        //                 face: _detectedFaces[0],
-        //                 imageSize: _currentImage!,
-        //               ),
-        //             ),
-        //         ],
-        //       );
-        //     } else {
-        //       return const Center(child: CircularProgressIndicator());
-        //     }
-        //   },
-        // ),
-        );
-  }
-}
-
-class DisplayPictureScreen extends StatefulWidget {
-  final String imagePath;
-
-  const DisplayPictureScreen({super.key, required this.imagePath});
-
-  @override
-  State<DisplayPictureScreen> createState() => _DisplayPictureScreenState();
-}
-
-class _DisplayPictureScreenState extends State<DisplayPictureScreen> {
-  Future<ui.Image> loadImage(String imagePath) async {
-    final Uint8List bytes = File(imagePath).readAsBytesSync();
-    final ui.Codec codec = await ui.instantiateImageCodec(bytes);
-    final ui.FrameInfo frame = await codec.getNextFrame();
-    final ui.Image image = frame.image;
-    return image;
-  }
-
-  Future<List<Face>> detectFaces(String image) async {
-    try {
-      final inputImage = InputImage.fromFilePath(image);
-      final faceDetector =
-          GoogleMlKit.vision.faceDetector(FaceDetectorOptions());
-      final faces = await faceDetector.processImage(inputImage);
-      return faces;
-    } catch (e) {
-      print('Error capturing image');
-      return [];
+      stackChildren.add(
+        Positioned(
+            top: 0.0,
+            left: 0.0,
+            width: size.width,
+            height: size.height,
+            child: buildResult()),
+      );
     }
-  }
 
-  late Future<List<dynamic>> _futureImage;
-
-  @override
-  void initState() {
-    super.initState();
-    _futureImage = Future.wait([
-      loadImage(widget.imagePath),
-      detectFaces(widget.imagePath),
-    ]);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('Display the picture')),
-      body: FutureBuilder(
-        future: _futureImage,
-        builder: (context, snapshot) {
-          if (snapshot.hasData) {
-            // final image = snapshot.data![0] as ui.Image;
-            // final faces = snapshot.data![1] as List<Face>;
-            return Stack(
-              children: [
-                Image.file(File(widget.imagePath)),
-                // CustomPaint(
-                //       painter: FacePainter(
-                //         face: faces[0],
-                //         imageSize: image,
-                //       ),
-                //     )
-
-                // CustomPaint(painter: FacePainter(image, faces)),
-              ],
-            );
-          }
-          return const Center(child: CircularProgressIndicator());
-        },
+    stackChildren.add(Positioned(
+      top: size.height - 140,
+      left: 0,
+      width: size.width,
+      height: 80,
+      child: Card(
+        margin: const EdgeInsets.only(left: 20, right: 20),
+        color: Colors.blue,
+        child: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: [
+                  IconButton(
+                    icon: const Icon(
+                      Icons.face_retouching_natural,
+                      color: Colors.white,
+                    ),
+                    iconSize: 20,
+                    color: Colors.black,
+                    onPressed: () {
+                      setState(() {
+                        register = true;
+                      });
+                    },
+                  )
+                ],
+              ),
+            ],
+          ),
+        ),
       ),
-    );
+    ));
+
+    return SafeArea(
+        child: Scaffold(
+      backgroundColor: Colors.black,
+      body: Container(
+        margin: const EdgeInsets.only(top: 0),
+        color: Colors.black,
+        child: Stack(
+          children: stackChildren,
+        ),
+      ),
+    ));
+
+    // final width = MediaQuery.of(context).size.width;
+    // final height = MediaQuery.of(context).size.height;
+    // final size = MediaQuery.sizeOf(context);
+    // double aspectRatio = MediaQuery.sizeOf(context).aspectRatio;
+    // return Scaffold(
+    //     body: Stack(
+    //   alignment: Alignment.bottomCenter, // Align children to the bottom center
+    //   children: [
+    //     Transform.scale(
+    //       scale: 1.0,
+    //       child: AspectRatio(
+    //         aspectRatio: MediaQuery.sizeOf(context).aspectRatio,
+    //         child: OverflowBox(
+    //           alignment: Alignment.center,
+    //           child: FittedBox(
+    //             fit: BoxFit.fitHeight,
+    //             child: SizedBox.expand(
+    //               // width: size.width,
+    //               // height: size.width * aspectRatio,
+    //               child: Stack(
+    //                 fit: StackFit.expand,
+    //                 children: <Widget>[
+    //                   CameraPreview(_controller),
+    //                   if (_detectedFaces
+    //                       .isNotEmpty) // Check if _detectedFaces is not empty
+    //                     CustomPaint(
+    //                       painter: FacePainter(
+    //                         face: _detectedFaces[0],
+    //                         imageSize: _currentImage!,
+    //                       ),
+    //                     ),
+    //                 ],
+    //               ),
+    //             ),
+    //           ),
+    //         ),
+    //       ),
+    //     ),
+    //     Positioned(
+    //         bottom: 0,
+    //         left: 0,
+    //         right: 0,
+    //         child: Padding(
+    //           padding: const EdgeInsets.symmetric(horizontal: 20),
+    //           child: Row(
+    //             mainAxisAlignment: MainAxisAlignment.spaceBetween,
+    //             children: [
+    //               IconButton(
+    //                 icon: const Icon(
+    //                   Icons.face_retouching_natural,
+    //                   color: Colors.white,
+    //                 ),
+    //                 iconSize: 40,
+    //                 onPressed: () {
+    //                   setState(() {
+    //                     register = true;
+    //                   });
+    //                 },
+    //               ),
+    //             ],
+    //           ),
+    //         ))
+    //   ],
+    // ));
   }
 }
