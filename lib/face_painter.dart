@@ -1,62 +1,54 @@
-import 'package:google_ml_kit/google_ml_kit.dart';
+import 'package:attendly/intepreter/Recognition.dart';
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 
-class FacePainter extends CustomPainter {
-  FacePainter({required this.imageSize, required this.face});
-  final Size imageSize;
-  double? scaleX, scaleY;
-  Face? face;
+class FaceDetectorPainter extends CustomPainter {
+  FaceDetectorPainter(this.absoluteImageSize, this.faces, this.camDire2);
+
+  final Size absoluteImageSize;
+  final List<Recognition> faces;
+  CameraLensDirection camDire2;
+
   @override
   void paint(Canvas canvas, Size size) {
-    if (face == null) return;
+    final double scaleX = size.width / absoluteImageSize.width;
+    final double scaleY = size.height / absoluteImageSize.height;
 
-    Paint paint;
+    final Paint paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0
+      ..color = Colors.indigoAccent;
 
-    if (this.face!.headEulerAngleY! > 10 || this.face!.headEulerAngleY! < -10) {
-      paint = Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 3.0
-        ..color = Colors.red;
-    } else {
-      paint = Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 3.0
-        ..color = Colors.green;
+    for (Recognition face in faces) {
+      canvas.drawRect(
+        Rect.fromLTRB(
+          camDire2 == CameraLensDirection.front
+              ? (face.location.right) * scaleX
+              : face.location.left * scaleX,
+          face.location.top * scaleY,
+          camDire2 == CameraLensDirection.front
+              ? (face.location.left) * scaleX
+              : face.location.right * scaleX,
+          face.location.bottom * scaleY,
+        ),
+        paint,
+      );
+
+      TextSpan span = TextSpan(
+          style: const TextStyle(color: Colors.white, fontSize: 20),
+          text: "${face.name}  ${face.distance.toStringAsFixed(2)}");
+      TextPainter tp = TextPainter(
+          text: span,
+          textAlign: TextAlign.left,
+          textDirection: TextDirection.ltr);
+      tp.layout();
+      tp.paint(canvas,
+          Offset(face.location.left * scaleX, face.location.top * scaleY));
     }
-
-    scaleX = size.width / imageSize.width;
-    scaleY = size.height / imageSize.height;
-
-    canvas.drawRRect(
-        _scaleRect(
-            rect: face!.boundingBox,
-            imageSize: imageSize,
-            widgetSize: size,
-            scaleX: scaleX ?? 1,
-            scaleY: scaleY ?? 1),
-        paint);
   }
 
   @override
-  bool shouldRepaint(FacePainter oldDelegate) {
-    return oldDelegate.imageSize != imageSize || oldDelegate.face != face;
+  bool shouldRepaint(FaceDetectorPainter oldDelegate) {
+    return true;
   }
-}
-
-RRect _scaleRect(
-    {required Rect rect,
-    required Size imageSize,
-    required Size widgetSize,
-    double scaleX = 1,
-    double scaleY = 1}) {
-  // debugPrint(rect)
-  debugPrint("rect $rect.left");
-
-  debugPrint("rect $rect.right");
-  return RRect.fromLTRBR(
-      (rect.left.toDouble() * scaleX),
-      rect.top.toDouble() * scaleY,
-      rect.right.toDouble() * scaleX,
-      rect.bottom.toDouble() * scaleY,
-      Radius.circular(10));
 }

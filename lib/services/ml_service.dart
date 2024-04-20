@@ -58,6 +58,7 @@ class MLService {
       //  debugPrint(row.toString());
       print(row[DatabaseHelper.columnName]);
       String name = row[DatabaseHelper.columnName];
+      int id = row[DatabaseHelper.columnId];
       // emb is list of double
       // converting String to Double from db
       List<double> embd = row[DatabaseHelper.columnEmbedding]
@@ -70,7 +71,7 @@ class MLService {
       // adding the new face if its not registered already
       // all the registered faces is loaded and we used the registered map to compare
       registered.putIfAbsent(name, () => recognition);
-      print("R=" + name);
+      print("R=${id}");
     }
   }
 

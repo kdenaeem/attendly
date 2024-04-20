@@ -24,14 +24,6 @@ class DatabaseHelper {
     );
   }
 
-  // Future _onCreate(Database db, int version) async {
-  //   await db.execute('''CREATE TABLE $table (
-  //       $columnId INTEGER PRIMARY KEY AUTOINCREMENT,
-  //       $columnName TEXT NOT NULL,
-  //       $columnEmbedding TEXT NOT NULL,
-  //     )''');
-  // }
-
   Future _onCreate(Database db, int version) async {
     await db.execute('''
           CREATE TABLE $table (
